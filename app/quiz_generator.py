@@ -1,119 +1,144 @@
 """
 Quiz Generator Module
 
-This module handles automatic quiz generation from text content.
+This module generates quiz questions from text content using OpenAI API.
 """
+import json
+import os
 from typing import Optional
+from openai import OpenAI
 from sqlalchemy.orm import Session
-from app.models import Quiz, Question, QuestionOption
+from app.models import Question
 
 
-class QuizGenerator:
-    """Generates quiz content from text"""
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    def __init__(self, db: Optional[Session] = None):
-        self.db = db
 
-    def generate_quiz_from_text(
-        self,
-        title: str,
-        content: str,
-        num_questions: int = 5,
-        source_pdf: Optional[str] = None
-    ) -> Quiz:
-        """
-        Generate a quiz from text content.
+def generate_questions(chunk_text: str, difficulty: str = "Medium") -> list[dict]:
+    """
+    Generate three types of quiz questions from a content chunk using OpenAI.
 
-        Args:
-            title: Quiz title
-            content: Text content to generate questions from
-            num_questions: Number of questions to generate
-            source_pdf: Source PDF file name
+    Args:
+        chunk_text: Text content to generate questions from
+        difficulty: Difficulty level (Easy, Medium, Hard) - default: Medium
 
-        Returns:
-            Quiz object with generated questions
-        """
-        # Create quiz
-        quiz = Quiz(
-            title=title,
-            description=f"Auto-generated quiz from PDF: {source_pdf}" if source_pdf else "Auto-generated quiz",
-            source_pdf=source_pdf
-        )
-
-        if self.db:
-            self.db.add(quiz)
-            self.db.commit()
-            self.db.refresh(quiz)
-
-        # TODO: Implement actual question generation logic
-        # This could integrate with an LLM API to generate questions
-        # For now, this is a placeholder structure
-
-        return quiz
-
-    def generate_question(self, content: str) -> dict:
-        """
-        Generate a single question from content.
-
-        Args:
-            content: Text content to generate question from
-
-        Returns:
-            Dictionary with question data
-        """
-        # TODO: Implement LLM-based question generation
-        return {
-            "question_text": "Sample question?",
-            "question_type": "multiple_choice",
-            "options": [
-                {"option_text": "Option A", "is_correct": 1},
-                {"option_text": "Option B", "is_correct": 0},
-                {"option_text": "Option C", "is_correct": 0},
-                {"option_text": "Option D", "is_correct": 0},
-            ]
+    Returns:
+        List of question dictionaries with format:
+        {
+            "question": "",
+            "type": "",
+            "options": [],
+            "answer": "",
+            "difficulty": ""
         }
 
-    def add_question_to_quiz(
-        self,
-        quiz_id: int,
-        question_text: str,
-        options: list[dict],
-        question_type: str = "multiple_choice"
-    ) -> Question:
-        """
-        Add a question to an existing quiz.
+    Raises:
+        ValueError: If chunk_text is empty or OpenAI API key is missing
+        Exception: If OpenAI API call fails
+    """
+    if not chunk_text or not chunk_text.strip():
+        raise ValueError("Chunk text cannot be empty")
 
-        Args:
-            quiz_id: ID of the quiz
-            question_text: Question text
-            options: List of question options with is_correct flag
-            question_type: Type of question
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY environment variable not set")
 
-        Returns:
-            Question object
-        """
-        if not self.db:
-            raise ValueError("Database session required")
+    prompt = f"""Generate exactly 3 quiz questions from the following text content. Return ONLY valid JSON array with no additional text.
 
-        question = Question(
-            quiz_id=quiz_id,
-            question_text=question_text,
-            question_type=question_type
+Text: {chunk_text}
+
+Generate:
+1. One Multiple Choice Question (MCQ) with 4 options
+2. One True/False Question
+3. One Fill-in-the-Blank Question
+
+For each question, follow this exact JSON format:
+{{
+    "question": "the question text",
+    "type": "MCQ" or "TrueFalse" or "FillBlank",
+    "options": ["option1", "option2", "option3", "option4"] (for MCQ only),
+    "answer": "correct answer",
+    "difficulty": "{difficulty}"
+}}
+
+Return as a JSON array ONLY:
+[question1, question2, question3]"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a quiz generator. Generate educational questions from text. Return ONLY valid JSON."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=1500
         )
 
-        self.db.add(question)
-        self.db.commit()
-        self.db.refresh(question)
+        response_text = response.choices[0].message.content.strip()
 
-        # Add options
-        for idx, option in enumerate(options):
-            q_option = QuestionOption(
-                question_id=question.id,
-                option_text=option["option_text"],
-                is_correct=option.get("is_correct", 0),
-                order=idx
+        # Parse JSON response
+        questions = json.loads(response_text)
+
+        # Validate and format questions
+        formatted_questions = []
+        for q in questions:
+            formatted_q = {
+                "question": q.get("question", ""),
+                "type": q.get("type", ""),
+                "options": q.get("options", []),
+                "answer": q.get("answer", ""),
+                "difficulty": q.get("difficulty", difficulty)
+            }
+            formatted_questions.append(formatted_q)
+
+        return formatted_questions
+
+    except json.JSONDecodeError as e:
+        raise Exception(f"Failed to parse OpenAI response as JSON: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Error generating questions: {str(e)}")
+
+
+def save_questions_to_db(chunk_id: int, questions: list[dict], db: Session) -> list[int]:
+    """
+    Save generated questions to the database.
+
+    Args:
+        chunk_id: ID of the ContentChunk
+        questions: List of question dictionaries from generate_questions()
+        db: SQLAlchemy session
+
+    Returns:
+        List of created Question IDs
+    """
+    question_ids = []
+
+    try:
+        for q in questions:
+            question = Question(
+                chunk_id=chunk_id,
+                question=q["question"],
+                type=q["type"],
+                options=q.get("options"),
+                answer=q["answer"],
+                difficulty=q["difficulty"]
             )
-            self.db.add(q_option)
+            db.add(question)
+            db.flush()
+            question_ids.append(question.id)
 
-        self.db.commit()
-        return question
+        db.commit()
+        return question_ids
+
+    except Exception as e:
+        db.rollback()
+        raise Exception(f"Error saving questions to database: {str(e)}")
+

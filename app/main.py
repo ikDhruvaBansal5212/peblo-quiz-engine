@@ -3,14 +3,20 @@ Peblo Quiz Engine - FastAPI Backend
 
 An AI-powered quiz generator that creates quizzes from PDF documents.
 """
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
+
 from fastapi import FastAPI, Depends, File, UploadFile, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from app.database import get_db, init_db
-from app.models import Quiz, Question, QuestionOption
-from app.ingest import PDFIngester
-from app.quiz_generator import QuizGenerator
+from app.models import Source, ContentChunk, Question, StudentAnswer
+from app.ingest import ingest_pdf, store_chunks
+from app.quiz_generator import generate_questions, save_questions_to_db
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -30,11 +36,21 @@ async def startup_event():
 from pydantic import BaseModel
 
 
-class QuestionOptionSchema(BaseModel):
+class SourceSchema(BaseModel):
     id: Optional[int] = None
-    option_text: str
-    is_correct: bool
-    order: int
+    name: str
+    subject: str
+    grade: str
+
+    class Config:
+        from_attributes = True
+
+
+class ContentChunkSchema(BaseModel):
+    id: Optional[int] = None
+    source_id: int
+    topic: str
+    text: str
 
     class Config:
         from_attributes = True
@@ -42,30 +58,26 @@ class QuestionOptionSchema(BaseModel):
 
 class QuestionSchema(BaseModel):
     id: Optional[int] = None
-    quiz_id: Optional[int] = None
-    question_text: str
-    question_type: str = "multiple_choice"
-    options: List[QuestionOptionSchema] = []
+    chunk_id: int
+    question: str
+    type: str
+    options: Optional[List] = None
+    answer: str
+    difficulty: str
 
     class Config:
         from_attributes = True
 
 
-class QuizSchema(BaseModel):
+class StudentAnswerSchema(BaseModel):
     id: Optional[int] = None
-    title: str
-    description: Optional[str] = None
-    source_pdf: Optional[str] = None
-    questions: List[QuestionSchema] = []
+    student_id: int
+    question_id: int
+    selected_answer: str
+    is_correct: bool
 
     class Config:
         from_attributes = True
-
-
-class QuizCreateSchema(BaseModel):
-    title: str
-    description: Optional[str] = None
-    source_pdf: Optional[str] = None
 
 
 # ==================== API Routes ====================
@@ -86,85 +98,168 @@ async def health_check():
     return {"status": "healthy"}
 
 
-@app.get("/quizzes", response_model=List[QuizSchema], tags=["quizzes"])
-async def get_quizzes(db: Session = Depends(get_db)):
-    """Get all quizzes"""
-    quizzes = db.query(Quiz).all()
-    return quizzes
+# ==================== Source Routes ====================
+
+@app.post("/sources", response_model=SourceSchema, tags=["sources"])
+async def create_source(source: SourceSchema, db: Session = Depends(get_db)):
+    """Create a new source"""
+    new_source = Source(name=source.name, subject=source.subject, grade=source.grade)
+    db.add(new_source)
+    db.commit()
+    db.refresh(new_source)
+    return new_source
 
 
-@app.post("/quizzes", response_model=QuizSchema, tags=["quizzes"])
-async def create_quiz(
-    quiz_data: QuizCreateSchema,
+@app.get("/sources", response_model=List[SourceSchema], tags=["sources"])
+async def get_sources(db: Session = Depends(get_db)):
+    """Get all sources"""
+    sources = db.query(Source).all()
+    return sources
+
+
+@app.get("/sources/{source_id}", response_model=SourceSchema, tags=["sources"])
+async def get_source(source_id: int, db: Session = Depends(get_db)):
+    """Get a specific source"""
+    source = db.query(Source).filter(Source.id == source_id).first()
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return source
+
+
+# ==================== Content Chunk Routes ====================
+
+@app.post("/chunks", response_model=List[int], tags=["chunks"])
+async def create_chunks(
+    source_id: int,
+    topic: str = "General",
     db: Session = Depends(get_db)
 ):
-    """Create a new quiz"""
-    quiz = Quiz(
-        title=quiz_data.title,
-        description=quiz_data.description,
-        source_pdf=quiz_data.source_pdf
-    )
-    db.add(quiz)
-    db.commit()
-    db.refresh(quiz)
-    return quiz
+    """Store text chunks for a source"""
+    # This is typically called from the ingest process
+    pass
 
 
-@app.get("/quizzes/{quiz_id}", response_model=QuizSchema, tags=["quizzes"])
-async def get_quiz(quiz_id: int, db: Session = Depends(get_db)):
-    """Get a specific quiz by ID"""
-    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
-    if not quiz:
-        raise HTTPException(status_code=404, detail="Quiz not found")
-    return quiz
+@app.get("/sources/{source_id}/chunks", response_model=List[ContentChunkSchema], tags=["chunks"])
+async def get_chunks(source_id: int, db: Session = Depends(get_db)):
+    """Get all chunks for a source"""
+    chunks = db.query(ContentChunk).filter(ContentChunk.source_id == source_id).all()
+    return chunks
 
 
-@app.post("/quizzes/{quiz_id}/questions", response_model=QuestionSchema, tags=["questions"])
-async def add_question(
-    quiz_id: int,
-    question_data: QuestionSchema,
+# ==================== Question Routes ====================
+
+@app.get("/chunks/{chunk_id}/questions", response_model=List[QuestionSchema], tags=["questions"])
+async def get_questions(chunk_id: int, db: Session = Depends(get_db)):
+    """Get all questions for a chunk"""
+    questions = db.query(Question).filter(Question.chunk_id == chunk_id).all()
+    return questions
+
+
+@app.post("/chunks/{chunk_id}/generate-questions", response_model=List[QuestionSchema], tags=["questions"])
+async def generate_chunk_questions(chunk_id: int, difficulty: str = "Medium", db: Session = Depends(get_db)):
+    """Generate questions for a chunk"""
+    try:
+        chunk = db.query(ContentChunk).filter(ContentChunk.id == chunk_id).first()
+        if not chunk:
+            raise HTTPException(status_code=404, detail="Chunk not found")
+
+        # Generate questions
+        questions = generate_questions(chunk.text, difficulty=difficulty)
+
+        # Save to database
+        question_ids = save_questions_to_db(chunk_id, questions, db)
+
+        # Return created questions
+        created_questions = db.query(Question).filter(Question.id.in_(question_ids)).all()
+        return created_questions
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Student Answer Routes ====================
+
+@app.post("/answers", response_model=StudentAnswerSchema, tags=["answers"])
+async def submit_answer(
+    student_id: int,
+    question_id: int,
+    selected_answer: str,
     db: Session = Depends(get_db)
 ):
-    """Add a question to a quiz"""
-    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
-    if not quiz:
-        raise HTTPException(status_code=404, detail="Quiz not found")
+    """Submit a student answer"""
+    try:
+        question = db.query(Question).filter(Question.id == question_id).first()
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found")
 
-    question = Question(
-        quiz_id=quiz_id,
-        question_text=question_data.question_text,
-        question_type=question_data.question_type
-    )
-    db.add(question)
-    db.commit()
-    db.refresh(question)
+        # Check if answer is correct
+        is_correct = selected_answer.lower().strip() == question.answer.lower().strip()
 
-    # Add options
-    for option in question_data.options:
-        q_option = QuestionOption(
-            question_id=question.id,
-            option_text=option.option_text,
-            is_correct=int(option.is_correct),
-            order=option.order
+        answer = StudentAnswer(
+            student_id=student_id,
+            question_id=question_id,
+            selected_answer=selected_answer,
+            is_correct=is_correct
         )
-        db.add(q_option)
-    db.commit()
-    db.refresh(question)
+        db.add(answer)
+        db.commit()
+        db.refresh(answer)
+        return answer
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return question
 
+@app.get("/students/{student_id}/answers", response_model=List[StudentAnswerSchema], tags=["answers"])
+async def get_student_answers(student_id: int, db: Session = Depends(get_db)):
+    """Get all answers from a student"""
+    answers = db.query(StudentAnswer).filter(StudentAnswer.student_id == student_id).all()
+    return answers
+
+
+# ==================== PDF Upload ====================
 
 @app.post("/upload-pdf", tags=["pdf"])
-async def upload_pdf(file: UploadFile = File(...)):
-    """Upload a PDF file for quiz generation"""
+async def upload_pdf(
+    file: UploadFile = File(...),
+    source_id: int = None,
+    topic: str = "General",
+    db: Session = Depends(get_db)
+):
+    """Upload and process a PDF file"""
     try:
-        ingester = PDFIngester()
-        content = await file.read()
-        saved_path = ingester.save_pdf(file.filename, content)
+        import tempfile
+        from pathlib import Path
+
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_path = tmp_file.name
+
+        # Extract and chunk PDF
+        chunks = ingest_pdf(tmp_path)
+
+        # Create source if not provided
+        if not source_id:
+            source = Source(
+                name=file.filename,
+                subject="General",
+                grade="General"
+            )
+            db.add(source)
+            db.commit()
+            source_id = source.id
+
+        # Store chunks in database
+        chunk_ids = store_chunks(source_id, chunks, topic=topic, db=db)
+
+        # Clean up temp file
+        Path(tmp_path).unlink()
+
         return {
             "filename": file.filename,
-            "saved_path": saved_path,
-            "size": len(content)
+            "source_id": source_id,
+            "chunks_created": len(chunk_ids),
+            "chunk_ids": chunk_ids
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
