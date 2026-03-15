@@ -1,11 +1,14 @@
 """
 PDF Ingestion Module
 
-This module handles reading, cleaning, and chunking text from PDF files.
+This module handles reading, cleaning, chunking text from PDF files, and storing chunks in the database.
 """
 import re
 from pathlib import Path
 import pdfplumber
+from sqlalchemy.orm import Session
+from app.database import SessionLocal
+from app.models import ContentChunk
 
 
 def extract_text_from_pdf(file_path: str) -> str:
@@ -109,4 +112,58 @@ def ingest_pdf(file_path: str) -> list[str]:
     cleaned_text = clean_text(raw_text)
     chunks = chunk_text(cleaned_text)
     return chunks
+
+
+def store_chunks(source_id: int, chunks: list[str], topic: str = "General", db: Session = None) -> list[int]:
+    """
+    Store text chunks in the database as ContentChunk records.
+
+    Args:
+        source_id: ID of the Source record
+        chunks: List of text chunks to store
+        topic: Topic name for the chunks (default: "General")
+        db: SQLAlchemy session (if None, creates a new one)
+
+    Returns:
+        List of created ContentChunk IDs
+
+    Raises:
+        ValueError: If source_id is invalid or chunks list is empty
+        Exception: If database operation fails
+    """
+    if not chunks:
+        raise ValueError("Chunks list cannot be empty")
+
+    if source_id <= 0:
+        raise ValueError("Invalid source_id: must be a positive integer")
+
+    # Use provided session or create a new one
+    session = db or SessionLocal()
+    close_session = db is None
+
+    try:
+        chunk_ids = []
+
+        for chunk_text in chunks:
+            if not chunk_text.strip():
+                continue
+
+            content_chunk = ContentChunk(
+                source_id=source_id,
+                topic=topic,
+                text=chunk_text.strip()
+            )
+            session.add(content_chunk)
+            session.flush()  # Flush to get the ID
+            chunk_ids.append(content_chunk.id)
+
+        session.commit()
+        return chunk_ids
+
+    except Exception as e:
+        session.rollback()
+        raise Exception(f"Error storing chunks in database: {str(e)}")
+    finally:
+        if close_session:
+            session.close()
 
