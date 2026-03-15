@@ -1,60 +1,112 @@
 """
 PDF Ingestion Module
 
-This module handles reading and extracting text from PDF files.
+This module handles reading, cleaning, and chunking text from PDF files.
 """
-import os
+import re
 from pathlib import Path
+import pdfplumber
 
 
-class PDFIngester:
-    """Handles PDF file ingestion and text extraction"""
+def extract_text_from_pdf(file_path: str) -> str:
+    """
+    Extract text content from a PDF file using pdfplumber.
 
-    def __init__(self, pdf_directory: str = "data/pdfs"):
-        self.pdf_directory = Path(pdf_directory)
-        self.pdf_directory.mkdir(parents=True, exist_ok=True)
+    Args:
+        file_path: Path to the PDF file
 
-    def extract_text_from_pdf(self, file_path: str) -> str:
-        """
-        Extract text content from a PDF file.
+    Returns:
+        Extracted text content from all pages
 
-        Args:
-            file_path: Path to the PDF file
+    Raises:
+        FileNotFoundError: If the PDF file does not exist
+        Exception: If PDF extraction fails
+    """
+    file_path = Path(file_path)
 
-        Returns:
-            Extracted text content
-        """
-        try:
-            # Import PyPDF2 here to handle optional dependency
-            from PyPDF2 import PdfReader
+    if not file_path.exists():
+        raise FileNotFoundError(f"PDF file not found: {file_path}")
 
-            with open(file_path, 'rb') as file:
-                pdf_reader = PdfReader(file)
-                text = ""
-                for page in pdf_reader.pages:
-                    text += page.extract_text()
-                return text
-        except ImportError:
-            raise ImportError("PyPDF2 is required for PDF processing. Install it using: pip install PyPDF2")
-        except Exception as e:
-            raise Exception(f"Error extracting text from PDF: {str(e)}")
+    try:
+        text = ""
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+        return text
+    except Exception as e:
+        raise Exception(f"Error extracting text from PDF: {str(e)}")
 
-    def get_pdf_files(self) -> list[str]:
-        """Get list of all PDF files in the PDF directory"""
-        return [f.name for f in self.pdf_directory.glob("*.pdf")]
 
-    def save_pdf(self, file_path: str, content: bytes) -> str:
-        """
-        Save uploaded PDF file to storage directory.
+def clean_text(text: str) -> str:
+    """
+    Clean extracted text by removing extra whitespace, special characters, and normalizing.
 
-        Args:
-            file_path: Name of the file
-            content: Binary content of the PDF
+    Args:
+        text: Raw text to clean
 
-        Returns:
-            Full path to saved file
-        """
-        full_path = self.pdf_directory / file_path
-        with open(full_path, 'wb') as f:
-            f.write(content)
-        return str(full_path)
+    Returns:
+        Cleaned text
+    """
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text)
+
+    # Remove special characters but keep basic punctuation
+    text = re.sub(r'[^\w\s\.\,\!\?\—\-\:\;]', '', text)
+
+    # Remove multiple spaces
+    text = re.sub(r' +', ' ', text)
+
+    # Strip leading and trailing whitespace
+    text = text.strip()
+
+    return text
+
+
+def chunk_text(text: str, chunk_size: int = 300) -> list[str]:
+    """
+    Split text into chunks of approximately the specified word count.
+
+    Args:
+        text: Text to split
+        chunk_size: Target word count per chunk (default: 300)
+
+    Returns:
+        List of text chunks
+    """
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_word_count = 0
+
+    for word in words:
+        current_chunk.append(word)
+        current_word_count += 1
+
+        # When chunk reaches target size, save it and start a new one
+        if current_word_count >= chunk_size:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = []
+            current_word_count = 0
+
+    # Add any remaining words as the final chunk
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+
+def ingest_pdf(file_path: str) -> list[str]:
+    """
+    Complete pipeline: extract, clean, and chunk a PDF file.
+
+    Args:
+        file_path: Path to the PDF file
+
+    Returns:
+        List of text chunks ready for processing
+    """
+    raw_text = extract_text_from_pdf(file_path)
+    cleaned_text = clean_text(raw_text)
+    chunks = chunk_text(cleaned_text)
+    return chunks
+
