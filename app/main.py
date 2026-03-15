@@ -163,8 +163,14 @@ async def generate_chunk_questions(chunk_id: int, difficulty: str = "Medium", db
         if not chunk:
             raise HTTPException(status_code=404, detail="Chunk not found")
 
-        # Generate questions
-        questions = generate_questions(chunk.text, difficulty=difficulty)
+        # Generate questions - use mock mode for demo
+        try:
+            questions = generate_questions(chunk.text, difficulty=difficulty)
+        except Exception as api_error:
+            # Fallback to mock mode
+            print(f"API Error, using mock mode: {str(api_error)}")
+            from app.quiz_generator import generate_mock_questions
+            questions = generate_mock_questions(chunk.text, difficulty=difficulty)
 
         # Save to database
         question_ids = save_questions_to_db(chunk_id, questions, db)
@@ -220,7 +226,7 @@ async def get_student_answers(student_id: int, db: Session = Depends(get_db)):
 @app.post("/upload-pdf", tags=["pdf"])
 async def upload_pdf(
     file: UploadFile = File(...),
-    source_id: int = None,
+    source_id: Optional[int] = None,
     topic: str = "General",
     db: Session = Depends(get_db)
 ):
