@@ -1,4 +1,4 @@
-# Peblo Quiz Engine (for checking backend)
+# Peblo Quiz Engine (for checking backend working properly)
 
 <div align="center">
 
